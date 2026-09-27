@@ -1,0 +1,133 @@
+# Veer Hanuman Trading Co. - Nginx site configuration (EXAMPLE)
+#
+# This is a template, NOT a configured file. Replace every <PLACEHOLDER>
+# before use. Nothing here has been applied to a real server.
+#
+#   install:  /etc/nginx/sites-available/veerhanuman
+#   enable:   ln -s /etc/nginx/sites-available/veerhanuman /etc/nginx/sites-enabled/
+#   test:     nginx -t
+#   reload:   systemctl reload nginx
+#
+# Assumes:
+#   - the built SPA lives at /var/www/veerhanuman/dist
+#   - the API runs on 127.0.0.1:4000 (see deploy/veerhanuman-api.service)
+#   - certificates were issued by certbot (see DEPLOYMENT.md)
+
+# ---------------------------------------------------------------- HTTP
+# Redirect everything to HTTPS, except the ACME challenge certbot needs.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name <YOUR_DOMAIN> www.<YOUR_DOMAIN>;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# --------------------------------------------------------------- HTTPS
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name <YOUR_DOMAIN> www.<YOUR_DOMAIN>;
+
+    ssl_certificate     /etc/letsencrypt/live/<YOUR_DOMAIN>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/<YOUR_DOMAIN>/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    root /var/www/veerhanuman/dist;
+    index index.html;
+
+    # ------------------------------------------------------- security
+    # HSTS: only enable once HTTPS is confirmed working, and be aware the
+    # max-age is honoured by browsers even if you later revert.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+    # Content-Security-Policy.
+    #
+    # This exact string was verified against the production build by
+    # `node scripts/csp-check.mjs`, which serves dist/ behind it and drives a
+    # browser over every public page plus /admin/login, failing on any
+    # violation the page reports. Keep the two in step: the script holds the
+    # same policy in its CSP constant, so change both together and re-run it.
+    #
+    # Why each non-obvious part is there:
+    #   style-src 'unsafe-inline'  React sets style attributes, and the
+    #                              <noscript> fallback in index.html is
+    #                              inline-styled. Tailwind itself is a file.
+    #   fonts.googleapis.com       the Google Fonts stylesheet (index.html)
+    #   fonts.gstatic.com          the font files that stylesheet references
+    #   img-src data:              inlined SVG illustrations
+    #   connect-src 'self'         correct ONLY while the SPA and API share
+    #                              one origin, which this config arranges. If
+    #                              you split them, add the API origin here.
+    # The JSON-LD that seo.tsx injects is a data block, not executable
+    # script, so 'unsafe-inline' is NOT needed in script-src.
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+
+    client_max_body_size 25m;   # must exceed MEDIA_MAX_DOCUMENT_MB
+
+    # ---------------------------------------------------------- ORDER
+    # These three location blocks MUST come before the SPA fallback.
+    # nginx picks exact matches (=) first, so order in the file does not
+    # strictly matter for them, but keep them together for clarity.
+
+    # Served dynamically by the API from the database, NOT from dist/.
+    # Without these two rules the SPA fallback returns index.html and you
+    # publish HTML where crawlers expect XML.
+    location = /sitemap.xml {
+        proxy_pass http://127.0.0.1:4000;
+        include proxy_params;
+    }
+
+    location = /robots.txt {
+        proxy_pass http://127.0.0.1:4000;
+        include proxy_params;
+    }
+
+    # API, uploaded media and health endpoints.
+    location /api/ {
+        proxy_pass http://127.0.0.1:4000;
+        include proxy_params;
+        proxy_http_version 1.1;
+        proxy_read_timeout 60s;
+    }
+
+    # Health endpoints should not be cached by any intermediary.
+    location = /api/health { proxy_pass http://127.0.0.1:4000; include proxy_params; add_header Cache-Control "no-store" always; }
+    location = /api/ready  { proxy_pass http://127.0.0.1:4000; include proxy_params; add_header Cache-Control "no-store" always; }
+
+    # ------------------------------------------------------- static
+    # Hashed asset filenames, so they can be cached hard.
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # SPA fallback. Deep links such as /products/rcc/rcc-chambers must serve
+    # index.html rather than 404.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # index.html itself must never be cached, or visitors keep an old bundle
+    # after a deploy.
+    location = /index.html {
+        add_header Cache-Control "no-cache, must-revalidate" always;
+    }
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json application/xml image/svg+xml;
+    gzip_min_length 1024;
+}

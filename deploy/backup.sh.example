@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#
+# Veer Hanuman Trading Co. - backup script (EXAMPLE)
+#
+# Template, not installed or scheduled by this repository. Review it, set
+# the paths, then add to cron:
+#   0 2 * * *  /usr/local/bin/veerhanuman-backup.sh >> /var/log/veerhanuman-backup.log 2>&1
+#
+# Backs up BOTH things that matter:
+#   1. the Postgres database
+#   2. uploaded media, which lives on disk and is NOT in the database
+# A database dump alone is not a complete backup.
+
+set -euo pipefail
+
+# ----------------------------------------------------------- configure
+BACKUP_ROOT="/var/backups/veerhanuman"
+MEDIA_DIR="/var/lib/veerhanuman/storage"
+DB_NAME="veerhanuman"
+DB_USER="veerhanuman"
+RETENTION_DAYS=30
+
+# Read the password from a root-only file rather than embedding it here.
+# Format: hostname:port:database:username:password
+export PGPASSFILE="/etc/veerhanuman/.pgpass"
+
+# ---------------------------------------------------------------- run
+STAMP="$(date +%Y%m%d-%H%M%S)"
+DEST="${BACKUP_ROOT}/${STAMP}"
+mkdir -p "${DEST}"
+
+echo "[backup] ${STAMP} starting"
+
+# --- database. Custom format so pg_restore can do selective restores.
+pg_dump --format=custom --no-owner --no-privileges \
+        --username="${DB_USER}" --dbname="${DB_NAME}" \
+        --file="${DEST}/database.dump"
+echo "[backup] database written ($(du -h "${DEST}/database.dump" | cut -f1))"
+
+# --- uploaded media
+if [ -d "${MEDIA_DIR}" ]; then
+  tar --create --gzip --file="${DEST}/media.tar.gz" -C "$(dirname "${MEDIA_DIR}")" "$(basename "${MEDIA_DIR}")"
+  echo "[backup] media written ($(du -h "${DEST}/media.tar.gz" | cut -f1))"
+else
+  echo "[backup] WARNING: media directory ${MEDIA_DIR} not found"
+fi
+
+# --- integrity check: a dump that cannot be listed is not a backup
+if ! pg_restore --list "${DEST}/database.dump" > /dev/null 2>&1; then
+  echo "[backup] ERROR: dump failed verification; keeping it for inspection"
+  exit 1
+fi
+echo "[backup] dump verified"
+
+# --- retention
+find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -mtime "+${RETENTION_DAYS}" -exec rm -rf {} +
+echo "[backup] pruned backups older than ${RETENTION_DAYS} days"
+
+# Copy off-box. A backup on the same disk as the database protects against
+# almost nothing. Uncomment and point at your own storage:
+# rclone copy "${DEST}" "remote:veerhanuman/${STAMP}"
+# aws s3 sync "${DEST}" "s3://<YOUR_BUCKET>/veerhanuman/${STAMP}"
+echo "[backup] REMINDER: off-site copy is not configured in this script"
+
+echo "[backup] ${STAMP} complete"

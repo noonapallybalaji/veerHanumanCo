@@ -1,0 +1,59 @@
+# Veer Hanuman Trading Co. - API service unit (EXAMPLE)
+#
+# Template, not a configured file. Replace <PLACEHOLDER> values.
+#   install: /etc/systemd/system/veerhanuman-api.service
+#   enable:  systemctl daemon-reload && systemctl enable --now veerhanuman-api
+#   logs:    journalctl -u veerhanuman-api -f
+
+[Unit]
+Description=Veer Hanuman Trading Co. API
+Documentation=file:///var/www/veerhanuman/DEPLOYMENT.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veerhanuman
+Group=veerhanuman
+WorkingDirectory=/var/www/veerhanuman
+
+# Secrets live in a root-owned file readable only by the service user.
+# Never put them in this unit: systemd units are world-readable.
+EnvironmentFile=/etc/veerhanuman/api.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/npm run start
+
+# Restart on crash, but back off so a boot-loop does not hammer the database.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Give in-flight requests time to finish; the app drains on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# ------------------------------------------------------------- hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# ProtectSystem=strict makes the filesystem read-only, so the one directory
+# the app writes to (uploaded media) must be granted explicitly.
+ReadWritePaths=/var/lib/veerhanuman/storage
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=veerhanuman-api
+
+[Install]
+WantedBy=multi-user.target

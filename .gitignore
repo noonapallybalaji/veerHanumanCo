@@ -1,0 +1,42 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Build output of the QA scripts
+.smoke
+.screenshots
+
+# Local environment overrides. .env holds AUTH_SECRET, IP_HASH_SALT and the
+# database password — it must never be committed. Copy .env.example instead.
+.env
+.env.local
+.env.*.local
+
+# Uploaded media. Files live on disk, not in the database, and belong to the
+# business — they are backed up separately, not version-controlled.
+server/storage/
+server/storage-test/
+
+# Scratch build used by scripts/csp-check.mjs
+dist-csp
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

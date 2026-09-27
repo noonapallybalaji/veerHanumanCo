@@ -1,0 +1,796 @@
+// Veer Hanuman Trading Co. — CMS schema
+//
+// DATABASE NOTE
+// Postgres in every environment - development, test and production - so
+// there is no dialect gap between what is tested and what ships.
+//
+// The schema still avoids two Prisma features for portability reasons:
+//
+//   * enum        -> status/role fields are String, validated by zod in
+//                    server/src/lib/constants.ts (the single source of the
+//                    allowed values). Keeping them as strings means a new
+//                    status needs no migration.
+//   * Json        -> structured fields are String holding JSON, read and
+//                    written through the helpers in server/src/lib/json.ts.
+//
+// Every content table carries status + timestamps + editor attribution so
+// the draft/publish lifecycle and the audit trail work uniformly.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../node_modules/.prisma/client"
+}
+
+// From Prisma 7 the connection URL is supplied by prisma.config.ts (which
+// reads DATABASE_URL), not by this file.
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------- Admin
+
+model AdminUser {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  // SUPER_ADMIN | CONTENT_EDITOR | REVIEW_MODERATOR
+  role         String
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  // Brute-force protection state.
+  failedLogins Int       @default(0)
+  lockedUntil  DateTime?
+  mustResetPw  Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions        Session[]
+  auditLogs       AuditLog[]
+  createdProducts Product[]       @relation("ProductCreatedBy")
+  updatedProducts Product[]       @relation("ProductUpdatedBy")
+  createdProjects Project[]       @relation("ProjectCreatedBy")
+  updatedProjects Project[]       @relation("ProjectUpdatedBy")
+  reviewEvents    ReviewEvent[]
+  enquiryNotes    EnquiryNote[]
+  media           Media[]
+  versions        ContentVersion[]
+
+  @@index([role])
+}
+
+/// Server-side session registry. The cookie holds a signed JWT whose `jti`
+/// must match a live row here, so logout and "revoke all" work immediately
+/// instead of waiting for the token to expire.
+model Session {
+  id        String    @id @default(cuid())
+  userId    String
+  user      AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ipHash    String?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ------------------------------------------------- Customers (visitors)
+//
+// DELIBERATELY SEPARATE FROM AdminUser.
+// A customer authenticates by phone OTP and has no password and no role.
+// Keeping them in their own table, with their own session store and their
+// own cookie, means there is no code path where a customer session could be
+// mistaken for an admin one. Merging the two behind a `role` column would
+// put the admin panel one bug away from a public login form.
+
+model Customer {
+  id    String  @id @default(cuid())
+  /// E.164, e.g. +919876543210. Unique, so one phone is one account and
+  /// repeated verification logs in rather than creating duplicates.
+  phone String  @unique
+  name  String
+  email String?
+  company String?
+
+  /// Set the first time an OTP is successfully verified for this number.
+  phoneVerifiedAt DateTime?
+
+  /// Separate from the consent needed to submit an enquiry, and optional.
+  marketingConsent Boolean @default(false)
+
+  /// Lets an admin stop a number that is abusing the forms.
+  isBlocked Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions  CustomerSession[]
+  leads     Lead[]
+  enquiries Enquiry[]
+
+  @@index([createdAt])
+}
+
+model CustomerSession {
+  id         String    @id @default(cuid())
+  customerId String
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  userAgent  String?
+  ipHash     String?
+  createdAt  DateTime  @default(now())
+
+  @@index([customerId])
+  @@index([expiresAt])
+}
+
+/// A one-time code. The code itself is never stored — only a salted hash —
+/// so a database leak cannot be replayed into account takeovers.
+model OtpChallenge {
+  id    String @id @default(cuid())
+  phone String
+  /// HMAC-SHA256 of the code, keyed with AUTH_SECRET.
+  codeHash String
+  /// WELCOME | ENQUIRY | LOGIN — recorded for the audit trail.
+  purpose  String @default("LOGIN")
+
+  expiresAt   DateTime
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  consumedAt  DateTime?
+
+  /// Drives the resend cooldown and the per-number send ceiling.
+  lastSentAt  DateTime @default(now())
+  sendCount   Int      @default(1)
+
+  ipHash    String?
+  createdAt DateTime @default(now())
+
+  @@index([phone, createdAt])
+  @@index([expiresAt])
+}
+
+/// Welcome-modal capture. Unlike an enquiry, a lead may be saved without
+/// phone verification — the modal is a low-friction greeting, so an
+/// unverified lead is still worth keeping, clearly flagged as unverified.
+model Lead {
+  id          String  @id @default(cuid())
+  name        String
+  phone       String
+  company     String?
+  email       String?
+  requirement String?
+
+  /// welcome-modal | contact-page | ...
+  source          String  @default("welcome-modal")
+  isPhoneVerified Boolean @default(false)
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+
+  /// Recorded when the visitor submitted the form carrying the consent text.
+  consentAccepted  Boolean @default(false)
+  marketingConsent Boolean @default(false)
+
+  ipHash    String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([isPhoneVerified])
+}
+
+// ------------------------------------------------------------ Catalogue
+
+model Division {
+  id           String     @id @default(cuid())
+  name         String
+  slug         String     @unique
+  displayOrder Int        @default(0)
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  categories   Category[]
+}
+
+model Category {
+  id          String   @id @default(cuid())
+  divisionId  String
+  division    Division @relation(fields: [divisionId], references: [id])
+  name        String
+  shortName   String?
+  slug        String   @unique
+  summary     String
+  description String
+  /// Built-in illustration key used when no photograph is set.
+  visual      String
+  imageId     String?
+  image       Media?   @relation("CategoryImage", fields: [imageId], references: [id])
+
+  displayOrder   Int     @default(0)
+  // DRAFT | IN_REVIEW | CHANGES_REQUESTED | PUBLISHED | ARCHIVED
+  status         String  @default("DRAFT")
+  seoTitle       String?
+  seoDescription String?
+
+  publishedAt DateTime?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  products Product[]
+
+  @@index([status])
+  @@index([divisionId])
+}
+
+model Product {
+  id         String   @id @default(cuid())
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  name String
+  /// Fuller name for titles/metadata where the short name is ambiguous
+  /// ("HDPE" -> "HDPE Pipes"). Falls back to `name`.
+  seoName String?
+  slug    String  @unique
+  sku     String?
+
+  summary     String
+  description String
+  visual      String
+
+  mainImageId String?
+  mainImage   Media?  @relation("ProductMainImage", fields: [mainImageId], references: [id])
+  ogImageId   String?
+  ogImage     Media?  @relation("ProductOgImage", fields: [ogImageId], references: [id])
+
+  /// JSON string: [{ label, value }]. Empty array renders
+  /// "Specifications available on request." Never populate with guesses.
+  specifications String @default("[]")
+  /// JSON string: string[]
+  useCases       String @default("[]")
+
+  featured     Boolean @default(false)
+  displayOrder Int     @default(0)
+  status       String  @default("DRAFT")
+
+  seoTitle       String?
+  seoDescription String?
+
+  publishedAt DateTime?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  createdById String?
+  createdBy   AdminUser? @relation("ProductCreatedBy", fields: [createdById], references: [id])
+  updatedById String?
+  updatedBy   AdminUser? @relation("ProductUpdatedBy", fields: [updatedById], references: [id])
+
+  images          ProductImage[]
+  documents       ProductDocument[]
+  applications    ProductApplication[]
+  requirementTags ProductRequirementTag[]
+  relatedFrom     RelatedProduct[]        @relation("RelatedFrom")
+  relatedTo       RelatedProduct[]        @relation("RelatedTo")
+  reviews         Review[]
+  projectLinks    ProjectProduct[]
+  enquiryItems    EnquiryItem[]
+
+  @@index([status])
+  @@index([categoryId])
+  @@index([featured])
+}
+
+model ProductImage {
+  id           String  @id @default(cuid())
+  productId    String
+  product      Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  mediaId      String
+  media        Media   @relation(fields: [mediaId], references: [id])
+  alt          String
+  caption      String?
+  displayOrder Int     @default(0)
+
+  @@index([productId])
+}
+
+model ProductDocument {
+  id           String  @id @default(cuid())
+  productId    String
+  product      Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  mediaId      String
+  media        Media   @relation(fields: [mediaId], references: [id])
+  title        String
+  displayOrder Int     @default(0)
+
+  @@index([productId])
+}
+
+// ------------------------------------------- Discovery taxonomy (tags)
+// These are discovery dimensions only. They must never become catalogue
+// categories — the hierarchy stays Division -> Category -> Product.
+
+model Application {
+  id           String  @id @default(cuid())
+  name         String
+  slug         String  @unique
+  description  String
+  icon         String
+  displayOrder Int     @default(0)
+  isActive     Boolean @default(true)
+
+  products ProductApplication[]
+  services ServiceApplication[]
+}
+
+model RequirementTag {
+  id           String  @id @default(cuid())
+  name         String
+  slug         String  @unique
+  hint         String
+  icon         String
+  displayOrder Int     @default(0)
+  isActive     Boolean @default(true)
+
+  products ProductRequirementTag[]
+  services ServiceRequirementTag[]
+}
+
+model ProductApplication {
+  productId     String
+  applicationId String
+  product       Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@id([productId, applicationId])
+}
+
+model ProductRequirementTag {
+  productId        String
+  requirementTagId String
+  product          Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  requirementTag   RequirementTag @relation(fields: [requirementTagId], references: [id], onDelete: Cascade)
+
+  @@id([productId, requirementTagId])
+}
+
+model RelatedProduct {
+  productId    String
+  relatedId    String
+  displayOrder Int     @default(0)
+  product      Product @relation("RelatedFrom", fields: [productId], references: [id], onDelete: Cascade)
+  related      Product @relation("RelatedTo", fields: [relatedId], references: [id], onDelete: Cascade)
+
+  @@id([productId, relatedId])
+}
+
+// -------------------------------------------------------------- Services
+
+model Service {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  summary     String
+  description String
+  visual      String
+  imageId     String?
+  image       Media?  @relation("ServiceImage", fields: [imageId], references: [id])
+
+  /// JSON string: [{ title, detail }]
+  scope String @default("[]")
+
+  displayOrder   Int     @default(0)
+  status         String  @default("DRAFT")
+  seoTitle       String?
+  seoDescription String?
+
+  publishedAt DateTime?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  applications    ServiceApplication[]
+  requirementTags ServiceRequirementTag[]
+
+  @@index([status])
+}
+
+model ServiceApplication {
+  serviceId     String
+  applicationId String
+  service       Service     @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@id([serviceId, applicationId])
+}
+
+model ServiceRequirementTag {
+  serviceId        String
+  requirementTagId String
+  service          Service        @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  requirementTag   RequirementTag @relation(fields: [requirementTagId], references: [id], onDelete: Cascade)
+
+  @@id([serviceId, requirementTagId])
+}
+
+// -------------------------------------------------------------- Projects
+
+model Project {
+  id      String @id @default(cuid())
+  title   String
+  slug    String @unique
+  summary String
+
+  description String
+  projectType String?
+  /// Only ever set from confirmed information.
+  location    String?
+
+  /// Client may only be shown publicly when `clientPublishable` is true.
+  clientName        String?
+  clientPublishable Boolean @default(false)
+
+  completedYear    Int?
+  scope            String?
+  quantitySupplied String?
+
+  /// Testimonial requires explicit consent before it can be published.
+  testimonialQuote   String?
+  testimonialAuthor  String?
+  testimonialConsent Boolean @default(false)
+
+  coverImageId String?
+  coverImage   Media?  @relation("ProjectCoverImage", fields: [coverImageId], references: [id])
+  visual       String  @default("infrastructure")
+
+  featured     Boolean @default(false)
+  displayOrder Int     @default(0)
+  status       String  @default("DRAFT")
+
+  seoTitle       String?
+  seoDescription String?
+
+  publishedAt DateTime?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  createdById String?
+  createdBy   AdminUser? @relation("ProjectCreatedBy", fields: [createdById], references: [id])
+  updatedById String?
+  updatedBy   AdminUser? @relation("ProjectUpdatedBy", fields: [updatedById], references: [id])
+
+  images   ProjectImage[]
+  products ProjectProduct[]
+
+  @@index([status])
+  @@index([featured])
+}
+
+model ProjectImage {
+  id           String  @id @default(cuid())
+  projectId    String
+  project      Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  mediaId      String
+  media        Media   @relation(fields: [mediaId], references: [id])
+  alt          String
+  caption      String?
+  displayOrder Int     @default(0)
+
+  @@index([projectId])
+}
+
+model ProjectProduct {
+  projectId String
+  productId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, productId])
+}
+
+// --------------------------------------------------------------- Reviews
+
+model Review {
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  id        String  @id @default(cuid())
+  productId String
+
+  displayName String
+  rating      Int
+  title       String?
+  body        String
+  companyName String?
+  useContext  String?
+  reference   String?
+
+  /// PENDING | APPROVED | REJECTED | HIDDEN
+  status String @default("PENDING")
+
+  consentAcknowledged Boolean @default(false)
+  /// Hashed, never the raw address — used only for rate limiting and abuse
+  /// investigation, and never returned by a public endpoint.
+  submitterIpHash     String?
+
+  /// Internal moderation note. Never exposed publicly.
+  internalReason String?
+
+  submittedAt DateTime  @default(now())
+  editedAt    DateTime?
+  publishedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  events  ReviewEvent[]
+  reports ReviewReport[]
+
+  @@index([productId, status])
+  @@index([status])
+}
+
+model ReviewEvent {
+  id        String     @id @default(cuid())
+  reviewId  String
+  review    Review     @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  /// SUBMITTED | APPROVED | REJECTED | HIDDEN | RESTORED | EDITED | REPORTED
+  action    String
+  actorId   String?
+  actor     AdminUser? @relation(fields: [actorId], references: [id])
+  reason    String?
+  createdAt DateTime   @default(now())
+
+  @@index([reviewId])
+}
+
+model ReviewReport {
+  id           String    @id @default(cuid())
+  reviewId     String
+  review       Review    @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  reason       String
+  reporterNote String?
+  /// OPEN | RESOLVED | DISMISSED
+  status       String    @default("OPEN")
+  createdAt    DateTime  @default(now())
+  resolvedAt   DateTime?
+  resolvedById String?
+
+  @@index([status])
+}
+
+// ------------------------------------------------- Company & site content
+
+/// Single row (id = "singleton"). Everything the public site needs to know
+/// about the business lives here, so a phone number change propagates to the
+/// header, footer, contact page, mobile bar and schema.org at once.
+model CompanyProfile {
+  id           String @id @default("singleton")
+  companyName  String
+  alternateName String?
+  proprietor   String?
+  establishedYear Int?
+  businessStructure String?
+  /// JSON string: string[]
+  natureOfBusiness  String @default("[]")
+  gstin        String?
+
+  phone    String @default("")
+  whatsapp String @default("")
+  email    String @default("")
+
+  addressLabel String  @default("Office")
+  addressLines String  @default("[]")
+  city         String  @default("")
+  state        String  @default("")
+  postalCode   String  @default("")
+  country      String  @default("India")
+
+  warehouseLabel String  @default("Additional location")
+  warehouseLines String  @default("[]")
+  warehouseCity  String  @default("")
+  warehouseState String  @default("")
+  warehousePostalCode String @default("")
+
+  /// JSON string: [{ days, hours }]
+  businessHours String @default("[]")
+  mapsUrl       String?
+  /// JSON string: [{ platform, url }]
+  socialLinks   String @default("[]")
+
+  siteUrl String @default("")
+
+  // Visibility toggles for third-party sourced or sensitive details.
+  showProprietor       Boolean @default(false)
+  showGstin            Boolean @default(false)
+  showWarehouseAddress Boolean @default(false)
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Offerings reported by third-party directories. Never public until an
+/// authorised admin flips `status` to CONFIRMED.
+model AdditionalOffering {
+  id           String   @id @default(cuid())
+  name         String
+  /// product | service
+  type         String
+  /// CONFIRMATION_REQUIRED | CONFIRMED | REJECTED
+  status       String   @default("CONFIRMATION_REQUIRED")
+  source       String
+  note         String
+  displayOrder Int      @default(0)
+  updatedAt    DateTime @updatedAt
+}
+
+/// A managed page assembled from ordered, typed sections ("about",
+/// "home"). Editors pick from predefined section types and fill fields —
+/// there is no raw HTML input anywhere, by design.
+model ContentPage {
+  id             String    @id @default(cuid())
+  key            String    @unique
+  title          String
+  status         String    @default("DRAFT")
+  seoTitle       String?
+  seoDescription String?
+  publishedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  sections ContentSection[]
+}
+
+model ContentSection {
+  id           String      @id @default(cuid())
+  pageId       String
+  page         ContentPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  /// One of the predefined section types — see SECTION_TYPES in constants.
+  type         String
+  enabled      Boolean     @default(true)
+  displayOrder Int         @default(0)
+  /// JSON string of the section's typed fields.
+  data         String      @default("{}")
+
+  @@index([pageId])
+}
+
+/// Point-in-time snapshot of a content entity, written on publish and
+/// before destructive edits so changes can be compared and restored.
+model ContentVersion {
+  id          String     @id @default(cuid())
+  entityType  String
+  entityId    String
+  version     Int
+  /// JSON string snapshot of the entity at this version.
+  snapshot    String
+  note        String?
+  createdById String?
+  createdBy   AdminUser? @relation(fields: [createdById], references: [id])
+  createdAt   DateTime   @default(now())
+
+  @@unique([entityType, entityId, version])
+  @@index([entityType, entityId])
+}
+
+// ---------------------------------------------------------------- Media
+
+model Media {
+  id         String  @id @default(cuid())
+  /// IMAGE | DOCUMENT
+  kind       String
+  /// Opaque storage key. Files are written outside the web root and served
+  /// through a controlled route, never as a static upload directory.
+  storageKey String  @unique
+  filename   String
+  mimeType   String
+  size       Int
+  width      Int?
+  height     Int?
+  checksum   String?
+  alt        String?
+
+  uploadedById String?
+  uploadedBy   AdminUser? @relation(fields: [uploadedById], references: [id])
+  createdAt    DateTime   @default(now())
+
+  productMain     Product[]         @relation("ProductMainImage")
+  productOg       Product[]         @relation("ProductOgImage")
+  productImages   ProductImage[]
+  productDocs     ProductDocument[]
+  categoryImages  Category[]        @relation("CategoryImage")
+  serviceImages   Service[]         @relation("ServiceImage")
+  projectCovers   Project[]         @relation("ProjectCoverImage")
+  projectImages   ProjectImage[]
+
+  @@index([kind])
+}
+
+// ------------------------------------------------------------- Enquiries
+
+model Enquiry {
+  id      String  @id @default(cuid())
+  name    String
+  company String?
+  phone   String
+  whatsapp String?
+  email   String?
+
+  projectType      String?
+  deliveryLocation String?
+  requirementDate  String?
+  notes            String?
+
+  /// NEW | CONTACTED | QUOTED | WON | LOST | CLOSED
+  status String @default("NEW")
+  /// Which page the enquiry came from.
+  source String?
+
+  /// Set by the server after the phone was proved by OTP. An enquiry can
+  /// only be created through a verified customer session, so this is always
+  /// true for new rows; it stays a column so older rows remain readable and
+  /// admins can see the provenance at a glance.
+  phoneVerified Boolean @default(false)
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items EnquiryItem[]
+  adminNotes EnquiryNote[]
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model EnquiryItem {
+  id        String   @id @default(cuid())
+  enquiryId String
+  enquiry   Enquiry  @relation(fields: [enquiryId], references: [id], onDelete: Cascade)
+  /// Kept as free text as well as a link, so the enquiry still reads
+  /// correctly if the product is later renamed or archived.
+  productName   String
+  productId     String?
+  product       Product? @relation(fields: [productId], references: [id])
+  quantity      String?
+  specification String?
+
+  @@index([enquiryId])
+}
+
+model EnquiryNote {
+  id        String    @id @default(cuid())
+  enquiryId String
+  enquiry   Enquiry   @relation(fields: [enquiryId], references: [id], onDelete: Cascade)
+  authorId  String?
+  author    AdminUser? @relation(fields: [authorId], references: [id])
+  body      String
+  createdAt DateTime  @default(now())
+
+  @@index([enquiryId])
+}
+
+// ------------------------------------------------------------- Audit log
+
+model AuditLog {
+  id         String     @id @default(cuid())
+  actorId    String?
+  actor      AdminUser? @relation(fields: [actorId], references: [id])
+  /// Kept denormalised so the trail survives user deletion.
+  actorEmail String?
+  action     String
+  entityType String
+  entityId   String?
+  summary    String
+  /// JSON string of a redacted before/after diff. Never contains secrets.
+  changes    String?
+  reason     String?
+  ipHash     String?
+  createdAt  DateTime   @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([actorId])
+}
